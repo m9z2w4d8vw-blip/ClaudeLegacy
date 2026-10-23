@@ -1,0 +1,159 @@
+name: Build iOS IPA
+run-name: "iOS 17 IPA • ${{ github.ref_name }} • ${{ github.event_name }}"
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Also upload the IPA directly to GitHub Releases?'
+        type: boolean
+        required: false
+        default: false
+
+# The build can read source, but cannot publish releases. Only the separate
+# release job receives permission to create releases.
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and package unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          swift --version
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: |
+          set -euo pipefail
+          test -f project.yml
+          xcodegen generate --spec project.yml
+          test -d ClaudeWeb17.xcodeproj
+
+      - name: Build app for physical iPhone (arm64, no signing)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ClaudeWeb17.xcodeproj \
+            -scheme ClaudeWeb17 \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/ClaudeWeb17DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            build 2>&1 | tee "$RUNNER_TEMP/ClaudeWeb17-xcodebuild.log"
+
+      - name: Create and verify IPA payload
+        id: ipa
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/ClaudeWeb17DerivedData/Build/Products/Release-iphoneos/ClaudeWeb17.app"
+          test -d "$APP" || { echo "Compiled .app not found: $APP"; exit 1; }
+          mkdir -p dist/Payload
+          ditto "$APP" dist/Payload/ClaudeWeb17.app
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IPA_NAME="ClaudeWeb17-iOS17-${SHORT_SHA}-unsigned.ipa"
+          (
+            cd dist
+            /usr/bin/zip -qr "$IPA_NAME" Payload
+          )
+          /usr/bin/unzip -t "dist/$IPA_NAME" >/dev/null
+          /usr/bin/unzip -Z1 "dist/$IPA_NAME" | grep '^Payload/ClaudeWeb17.app/' >/dev/null
+          rm -rf dist/Payload
+          echo "ipa_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
+          echo "ipa_path=dist/$IPA_NAME" >> "$GITHUB_OUTPUT"
+          echo "Created dist/$IPA_NAME"
+
+      - name: Upload unsigned IPA to Actions artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeWeb17-iOS17-unsigned-${{ github.run_number }}
+          path: ${{ steps.ipa.outputs.ipa_path }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload build log if compilation fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeWeb17-build-log-${{ github.run_number }}
+          path: ${{ runner.temp }}/ClaudeWeb17-xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Direct-download IPA on GitHub Releases
+    # Release only on v* tags, or when checked during a manual run.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built IPA
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ClaudeWeb17-iOS17-unsigned-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release (or replace existing IPA)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          IPAS=(dist/*.ipa)
+          if (( ${#IPAS[@]} != 1 )); then
+            echo "Expected exactly one IPA in dist/, found ${#IPAS[@]}"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="dev-${GITHUB_SHA:0:7}"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${IPAS[0]}" --clobber
+          else
+            gh release create "$TAG" "${IPAS[0]}" \
+              --target "$GITHUB_SHA" \
+              --title "ClaudeWeb17 $TAG (unsigned IPA)" \
+              --notes "iOS 17.0+ arm64 build. Unsigned IPA: requires a compatible signing or sideloading method. Unofficial Claude WebKit client; login behavior must be tested on a device." \
+              --prerelease
+          fi
